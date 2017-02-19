@@ -1,36 +1,76 @@
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
+const { Observable } = require('rxjs');
+const chalk = require('chalk');
 const google = require('googleapis');
-const googleAuth = require('google-auth-library');
+const GoogleAuth = require('google-auth-library');
 const drive = google.drive('v3');
 const sheets = google.sheets('v4');
-const { Observable } = require('rxjs');
+const OAuth2 = (new GoogleAuth()).OAuth2;
 
-const TOKEN_FILENAME = 'sheets.googleapis.com.rw.json';
+const {
+  getHomeDir,
+  writeFile,
+  readFile,
+  prompt,
+} = require('./utils.js');
 
+const STORED_TOKEN_PATH = path.resolve(
+  getHomeDir(),
+  '.credentials',
+  'sheets.googleapis.com.rw.json'
+);
+
+// The permissions I'm asking for from google on the users behalf. This will
+// dictate what the google auth window shows to the user
+// Docs: https://developers.google.com/identity/protocols/googlescopes
 const SCOPES = [
+  // For spreadsheets read/write
   'https://www.googleapis.com/auth/spreadsheets',
+
+  // Just for listing files and searching. Necessary to map a string filename
+  // (i.e. a spreadsheet title) to a spreadsheet id for use with the
+  // spreadsheets API
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
 ];
-
-const getHomeDir = () =>
- process.env.HOME || process.env.HOMEPATH || process.env.USERPROFILE;
-
-const STORED_TOKEN_PATH = path.resolve(getHomeDir(), '.credentials', TOKEN_FILENAME);
-
-const readFile = Observable.bindNodeCallback(fs.readFile);
-const writeFile = Observable.bindNodeCallback(fs.writeFile);
 
 /**
  * Store the token from a google OAuth2 object. This is just so that we don't
  * have to reauth with every request.
  */
-const storeToken = (auth) => {
-  const token = auth.credentials;
-  writeFile(STORED_TOKEN_PATH, JSON.stringify(token)).subscribe(
-    () => console.log(`Stored credentials to ${STORED_TOKEN_PATH}`),
-    (err) => console.log(`Could not write to ${STORED_TOKEN_PATH}`, err)
-  );
+const storeToken = (token) => {
+  // Try to make the directory so that we are sure it exists
+  try {
+    fs.mkdirSync(path.dirname(STORED_TOKEN_PATH), 0o700);
+  } catch (err) {
+    if (err.code != 'EEXIST') {
+      throw err;
+    }
+  }
+
+  Observable.of(token)
+    .map(x => JSON.stringify(x))
+    .do(() => console.log('made it here'))
+    .mergeMap(str => writeFile(STORED_TOKEN_PATH, str))
+    .do(() => console.log('made it more to here'))
+    .subscribe(
+      () => console.log(`Stored credentials to ${chalk.cyan(STORED_TOKEN_PATH)}`),
+      (err) => console.log(`Could not write to ${chalk.red(STORED_TOKEN_PATH)}`, err)
+    );
+};
+
+const getToken = (auth, authCode) => {
+  return Observable.create(obs => {
+    auth.getToken(authCode, (err, token) => {
+      if (err) {
+        obs.error(err);
+        return;
+      }
+
+      obs.next(token);
+      obs.complete();
+    });
+  });
 };
 
 const getNewToken = (auth) => {
@@ -39,54 +79,41 @@ const getNewToken = (auth) => {
     scope: SCOPES
   });
 
-  console.log('Authorize this app by visiting this url: ', authUrl);
+  console.log('Authorize this app by visiting this url: ', chalk.green(authUrl));
+  console.log();
 
-  return Observable.create(obs => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
+  return prompt('Enter the code from that page here: ')
+    .mergeMap(authCode =>
+      getToken(auth, authCode)
+        .do(storeToken, (err) => console.log('Error while trying to retrieve access token', err)))
+    .map(token => {
+      auth.credentials = token;
+      return auth;
     });
-
-    // TODO: This is all very non-idiomatic. I just wanted to move quickly
-    rl.question('Enter the code from that page here: ', (code) => {
-      rl.close();
-      auth.getToken(code, function(err, token) {
-        if (err) {
-          console.log('Error while trying to retrieve access token', err);
-          obs.error(err);
-          return;
-        }
-
-        auth.credentials = token;
-        obs.next(auth);
-        obs.complete();
-      });
-    });
-
-    return () => rl.close();
-  })
-  .do(storeToken); // Store that token (we don't care about the outcome of this)
-
 };
 
 const authorizeGoogleClientSecret = (json) => {
   const clientSecret = json.installed.client_secret;
   const clientId = json.installed.client_id;
   const redirectUrl = json.installed.redirect_uris[0];
-  const auth = new googleAuth();
-  const oauth2Client = new auth.OAuth2(clientId, clientSecret, redirectUrl);
+  const auth = new OAuth2(clientId, clientSecret, redirectUrl);
 
   return readFile(STORED_TOKEN_PATH)
     .map(x => JSON.parse(x))
     .map(token => {
-      oauth2Client.credentials = token;
-      return oauth2Client;
+      auth.credentials = token;
+      return auth;
     })
     .catch(err => {
-      console.log(`Error reading ${STORED_TOKEN_PATH}. Generating new token...`);
-      return getNewToken(oauth2Client);
+      console.log(`Unable to read stored token from ${chalk.cyan(STORED_TOKEN_PATH)}. Generating new token...`);
+      return getNewToken(auth);
     });
 };
+
+const getAuthFromClientSecret = (filepath) =>
+  readFile(filepath)
+    .map(x => JSON.parse(x))
+    .mergeMap(authorizeGoogleClientSecret);
 
 const listAll = () => {
   return Observable.create((obs) => {
@@ -117,9 +144,7 @@ const valueRangeFromValue = (value) => ({
 // User entered means the string inserted will be handled as if the user typed
 // it in the UI. Meaning any formatting or formula parsing will be applied
 const appendCell = (value) => {
-  return readFile('client_secret.json')
-    .map(x => JSON.parse(x))
-    .mergeMap(authorizeGoogleClientSecret)
+  return getAuthFromClientSecret('client_secret.json')
     .mergeMap(auth => {
       return Observable.create(obs => {
         sheets.spreadsheets.values.append({
@@ -148,11 +173,11 @@ module.exports = {
 
 // Just for testing
 const loggerObservable = {
-  next: (x) => console.log('NEXT', x),
+  next: (x) => console.log('RESULT\n', x),
   error: (err) => console.log('ERROR', err),
   complete: () => console.log('COMPLETE'),
 };
 
-appendCell('hey you' + Math.random())
+appendCell('hey you ' + Math.random())
   .subscribe(loggerObservable);
 

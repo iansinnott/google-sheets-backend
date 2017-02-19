@@ -6,7 +6,7 @@ var googleAuth = require('google-auth-library');
 // If modifying these scopes, delete your previously saved credentials
 // at ~/.credentials/sheets.googleapis.com-nodejs-quickstart.json
 var SCOPES = [
-'https://www.googleapis.com/auth/spreadsheets.readonly'
+  'https://www.googleapis.com/auth/spreadsheets.readonly'
 ];
 var TOKEN_DIR = (process.env.HOME || process.env.HOMEPATH ||
     process.env.USERPROFILE) + '/.credentials/';
